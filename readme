@@ -1,0 +1,308 @@
+Coastline Water Quality Tracker – Code Overview
+================================================
+
+Purpose
+-------
+This script continuously reads four analog sensor values (pH, H₂S, Dissolved Oxygen, and NH₃) from ADC pins on an ESP32, evaluates each against safety thresholds using a `Rangefinder` class, and displays an overall status via an RGB LED using an `Alert_system` class. It supports **SMS alerts** using a SIM800L cellular module and **Wi-Fi reporting** to a Flask server.
+
+Imports
+-------
+- `machine`: `ADC`, `Pin`, `UART`
+- `time`: delays and timing
+- `network`: Wi-Fi STA interface
+- `urequests`: HTTP POST to Flask server
+- `gc`: garbage collection after network operations
+
+Constants & Calibration
+----------------------
+- `PH7_ADC = 1788` — ADC reading at pH 7 (calibration point)
+- `PH4_ADC = 2432` — ADC reading at pH 4 (calibration point)
+
+Sensor pins:
+  - pH  → Pin 34
+  - H₂S → Pin 32
+  - DO  → Pin 35
+  - NH₃ → Pin 33
+
+RGB LED pins (common cathode; `Pin.on()` lights the LED):
+  - Red   → Pin 13
+  - Green → Pin 12
+  - Blue  → Pin 14
+
+Note: the green and blue assignments were swapped after the first hardware
+test — `green.on()` lit the blue LED, so Pin 12 is the green channel and
+Pin 14 is the blue channel. The pins themselves were never changed.
+
+SMS Configuration
+----------------
+- `SMS_PHONE = "+15551234567"` — replace with the destination number.
+- SIM800L is accessed via UART2 with the exact parameters used in `gsm_test.py`:
+  ```python
+  self.gsm = UART(2, baudrate=9600, tx=17, rx=16, timeout=2000)
+  ```
+- 20‑minute cooldown after each SMS; consecutive‑count thresholds:
+  - **Danger** → send after 4 consecutive Danger readings
+  - **Warning** → send after 5 consecutive Warning readings
+- Per-severity cooldowns: Danger can bypass Warning cooldown
+- Network registration check (`AT+CREG?` → `0,1` or `0,5`) before sending
+
+ADC Setup
+---------
+`setup_adc(pin)` creates an `ADC` on the given pin, sets attenuation to
+`ADC.ATTN_11DB` (full‑scale range) and resolution to `ADC.WIDTH_12BIT`
+(12‑bit, 0–4095). Returns the configured ADC object.
+
+One sensor object is created per pin: `ph_sensor`, `h2s_sensor`,
+`do_sensor`, `nh3_sensor`.
+
+Reading Functions
+-----------------
+`read_ph()`:
+  - Reads the raw ADC value from `ph_sensor` using median-of-5 filter.
+  - Calculates pH via the two‑point calibration:
+        ph = 7.0 - ((raw - PH7_ADC) / (PH4_ADC - PH7_ADC)) * 3.0
+  - Clamps the result to the valid range (0.0 … 14.0).
+  - Returns a tuple `(raw, ph)`.
+
+`read_h2s()`, `read_do()`, `read_nh3()`:
+  - Return the median-of-5 filtered raw ADC reading (0–4095) from the respective sensor.
+
+Timer Configuration
+-------------------
+- `READ_INTERVAL_MS = 2000` — sensor sampling interval
+- `SMS_COOLDOWN_MS = 1200000` — 20 minutes SMS cooldown
+
+Status Logic (from Proposal 2.0):
+- Status updates instantly based on the number of sensors in Danger:
+  - **Danger**: All 4 sensors are in Danger.
+  - **Warning**: 2 or more sensors are in Danger.
+  - **Normal**: 0 or 1 sensor is in Danger.
+
+SMS Debounce:
+- SMS is only sent after sustained status:
+  - **Danger SMS**: 4 consecutive overall-Danger readings
+  - **Warning SMS**: 5 consecutive overall-Warning readings
+
+Raw ADC Thresholds (DEVELOPMENT PLACEHOLDERS — calibrate before deployment):
+- `DO_WATCH_ADC = 1024`  — ~5.0 mg/L (WATCH threshold)
+- `DO_CRIT_ADC = 410`    — ~2.0 mg/L (critical threshold for DANGER)
+- `H2S_CRIT_ADC = 1024`  — ~5 ppm
+- `NH3_CRIT_ADC = 1024`  — ~10 ppm
+
+Classes
+-------
+
+### `Rangefinder(name, normal_low, normal_high, danger_low=None, danger_high=None)`
+Threshold evaluator for a single sensor.
+- `compare(value)` → returns `"Normal"`, `"Warning"`, or `"Danger"`:
+  - **Danger**: below `danger_low` OR above `danger_high` (when set)
+  - **Normal**: within `[normal_low, normal_high]`
+  - **Warning**: outside the normal band but not in a danger zone
+
+Instances:
+| Sensor | Normal Range | Danger Low | Danger High |
+|--------|--------------|------------|-------------|
+| pH     | 6.5 – 7.75   | 5.5        | 9.0         |
+| DO     | 5 – 20       | 2          | —           |
+| H₂S    | 0 – 1        | —          | 5           |
+| NH₃    | 0 – 1        | —          | 5           |
+
+### `Alert_system(red, green, blue)`
+Controls the RGB LED (common cathode) to reflect the overall status:
+| Status   | LED Behavior                    |
+|----------|---------------------------------|
+| Normal   | Green ON                        |
+| Warning  | Yellow (red + green ON)         |
+| Danger   | Red flashing (0.5 s on/off)      |
+
+Non-blocking: uses `time.ticks_ms()` diff for flash timing.
+
+### `Sms_system`
+Implements SMS alerting using the exact UART configuration from `gsm_test.py`:
+```python
+class Sms_system:
+    def __init__(self):
+        # UART2, 9600 baud, TX = 17, RX = 16 – verified in gsm_test.py
+        self.gsm = UART(2, baudrate=9600, tx=17, rx=16, timeout=2000)
+
+    def _wait_for(self, pattern, timeout=5000):
+        """Poll gsm.any() until pattern appears or timeout. Returns True if found."""
+        ...
+
+    def _send_at(self, command, wait_ok=True, timeout=5000):
+        """Send AT command, require OK. Returns True on success."""
+        ...
+
+    def check_network(self):
+        """Return True if modem registered (CREG 0,1 or 0,5)."""
+        ...
+
+    def send_sms(self, phone_number, message, severity="Warning"):
+        """Strict handshake: AT → CMGF=1 → CMGS → wait for '>' → send message → Ctrl+Z → wait for +CMGS: + OK.
+        Only starts cooldown on confirmed success. Failure backoff on ERROR/timeout.
+        Per-severity cooldowns via time.ticks_add (wrap-safe).
+        """
+        ...
+```
+
+Key improvements over prototype:
+- `_wait_for` polls for responses instead of fixed delays
+- Verifies `+CMGS:` AND `OK` before declaring success
+- Checks `AT+CREG?` for network registration before sending
+- Wrap-safe cooldowns using `time.ticks_add` + `time.ticks_diff`
+- Per-severity cooldowns: Danger bypasses Warning cooldown
+- Failure backoff prevents tight loop on dead modem
+
+Main Loop (non‑blocking, 20 ms tick)
+------------------------------------
+```python
+try:
+    last_read = 0
+    overall_status = "Normal"
+    watch_start = None
+    danger_start = None
+    while True:
+        now = time.ticks_ms()
+        if last_read == 0 or time.ticks_diff(now, last_read) >= READ_INTERVAL_MS:
+            last_read = now
+            # --- Sensor reads ---
+            ph_raw, ph_val = read_ph()
+            h2s_raw = read_h2s()
+            do_raw = read_do()
+            nh3_raw = read_nh3()
+
+            # --- Spec conditions ---
+            watch_condition = (do_raw < DO_WATCH_ADC) or (ph_val >= 7.7)
+            danger_condition = (do_raw < DO_CRIT_ADC) and (h2s_raw > H2S_CRIT_ADC) and (nh3_raw >= NH3_CRIT_ADC)
+
+            # --- Track timers independently (FIXED) ---
+            if watch_condition:
+                if watch_start is None:
+                    watch_start = now
+            else:
+                watch_start = None
+
+            if danger_condition:
+                if danger_start is None:
+                    danger_start = now
+            else:
+                danger_start = None
+
+            # --- Determine overall status ---
+            if danger_start is not None and time.ticks_diff(now, danger_start) >= DANGER_MS:
+                overall_status = "Danger"
+            elif watch_start is not None and time.ticks_diff(now, watch_start) >= WATCH_MS:
+                overall_status = "Warning"
+            else:
+                overall_status = "Normal"
+
+            # --- Per-sensor statuses for Flask ---
+            ph_status = ph1.compare(ph_val)
+            do_status = do2.compare(do_raw)
+            h2s_status = h2s3.compare(h2s_raw)
+            nh3_status = nh34.compare(nh3_raw)
+
+            # --- SMS escalation (consecutive overall status, severity-aware cooldown) ---
+            if overall_status == "Danger":
+                sms_system._danger_count += 1
+                sms_system._warning_count = 0
+                if sms_system._danger_count >= 4:
+                    sms_system._danger_count = 0
+                    sms_system._warning_count = 0
+                    sms_system.send_sms(SMS_PHONE, "DANGER: Water quality alert! Sustained critical levels detected.", "Danger")
+            elif overall_status == "Warning":
+                sms_system._warning_count += 1
+                sms_system._danger_count = 0
+                if sms_system._warning_count >= 5:
+                    sms_system._danger_count = 0
+                    sms_system._warning_count = 0
+                    sms_system.send_sms(SMS_PHONE, "WARNING: Water quality warning! Sustained watch levels detected.", "Warning")
+            else:
+                sms_system._danger_count = 0
+                sms_system._warning_count = 0
+
+            # --- Wi-Fi reconnect (non-blocking, interval-based) ---
+            if not wlan.isconnected():
+                if time.ticks_diff(now, last_wifi_retry) > 30000:
+                    wlan = connect_wifi()
+                    last_wifi_retry = now
+            else:
+                last_wifi_retry = now
+
+            # --- POST to Flask ---
+            if wlan.isconnected():
+                data = {
+                    "station_id": STATION_ID,
+                    "timestamp": time.time() + 946684800,  # fix MicroPython 2000 epoch
+                    "ph": round(ph_val, 2),              # calibrated pH units
+                    "do": do_raw, "h2s": h2s_raw, "nh3": nh3_raw,     # legacy keys for Flask compat
+                    "do_adc": do_raw, "h2s_adc": h2s_raw, "nh3_adc": nh3_raw,  # explicit raw ADC
+                    "do_calibrated": False, "h2s_calibrated": False, "nh3_calibrated": False,
+                    "ph_status": ph_status, "do_status": do_status,
+                    "h2s_status": h2s_status, "nh3_status": nh3_status,
+                    "overall_status": overall_status,
+                }
+                # POST with try/except/finally + gc.collect()
+
+        alert_system.update(overall_status)
+        time.sleep_ms(20)
+except KeyboardInterrupt:
+    # Clean shutdown: all LEDs off
+```
+
+Network Configuration (Physical Deployment)
+-------------------------------------------
+- `WIFI_SSID = "Sargassum-Dashboard"`
+- `WIFI_PASSWORD = "Sargassum2026"`
+- `SERVER_URL = "http://10.42.0.1:5000/api/data"` — Flask LAN IP (dashboard machine `wlo1` interface)
+- `STATION_ID = "coastline-01"`
+
+Non-blocking reconnect: attempts every 30 s, never blocks the 2 s sensor loop.
+
+Payload Schema (sent to Flask `/api/data`)
+------------------------------------------
+```json
+{
+  "station_id": "coastline-01",
+  "timestamp": 1791800000,
+  "ph": 7.12,
+  "do": 1234,
+  "h2s": 567,
+  "nh3": 890,
+  "do_adc": 1234,
+  "h2s_adc": 567,
+  "nh3_adc": 890,
+  "do_calibrated": false,
+  "h2s_calibrated": false,
+  "nh3_calibrated": false,
+  "ph_status": "Normal",
+  "do_status": "Normal",
+  "h2s_status": "Normal",
+  "nh3_status": "Normal",
+  "overall_status": "Normal"
+}
+```
+- `ph` = calibrated pH (0–14)
+- `do`/`h2s`/`nh3` = legacy keys kept for Flask compat (raw ADC counts)
+- `*_adc` = explicit raw ADC naming (uncalibrated)
+- `*_calibrated` = flags for honest labeling in dashboard
+- `timestamp` = Unix epoch (MicroPython 2000 epoch + 946684800 offset). **Note**: still needs NTP sync for accuracy.
+
+Flask Server (`sargassum-dashboard/app.py`)
+-------------------------------------------
+- Runs on `host="0.0.0.0", port=5000`
+- `/api/data` POST accepts the payload above
+- `check_alert()` reads `overall_status` and fires Telegram on status change
+- **Known issue**: `check_alert()` currently labels raw ADC values as "mg/L" and "ppm" in Telegram messages. The ESP32 now sends `*_calibrated: False` flags so the dashboard can label honestly once updated.
+
+Verification Steps
+-------------------
+1. **Syntax check** — `python -m py_compile blink.py` (passes).
+2. **Timer bug fix** — hold a danger condition and confirm the WATCH timer still reaches 15 min independently (previously it reset every 2 s and never fired).
+3. **Threshold separation** — confirm DO between the two cutoffs triggers WATCH but not the critical path.
+4. **SMS** — on hardware, watch serial for `GSM ->` / `GSM <-`; confirm cooldown starts **only** after `+CMGS` + `OK`, and does **not** start on `ERROR`/timeout.
+5. **Severity bypass** — send a Warning SMS, then escalate to Danger within the cooldown window and confirm the Danger SMS still goes out.
+6. **Network** — kill the Flask server and the Wi-Fi AP separately; confirm sampling continues and the device recovers without a reboot.
+7. **Payload** — `curl -X POST` the exact JSON and confirm Flask returns `{"message": "Data received"}` and the dashboard renders.
+
+**Note** — The SIM800L draws ~2 A peak; ensure the external power board supplies at least that much current before testing the SMS path.

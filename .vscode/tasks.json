@@ -1,0 +1,23 @@
+
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Run MicroPython on ESP32",
+      "type": "process",
+      "command": "/home/Darwin/esp32-flash-venv/bin/mpremote",
+      "args": [
+        "connect",
+        "/dev/ttyUSB0",
+        "run",
+        "${file}"
+      ],
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "clear": true
+      }
+    }
+  ]
+}

@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//home/Darwin/important files/**)",
+      "Read(//home/Darwin/sargassum-dashboard/templates/**)",
+      "Bash(python3 -m py_compile blink.py)"
+    ]
+  }
+}
